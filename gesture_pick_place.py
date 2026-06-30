@@ -16,7 +16,7 @@ TAIROA「視覺與機器人整合實作練習」
   2. MediaPipe Hand Landmarker 辨識手部 21 個關節點
   3. 幾何規則數出伸直的手指數 (1~5)
   4. 同一手指數維持 N 秒 → 鎖定手勢
-  5. GPIO 數位訊號 (one-hot) 通知手臂移到對應取料點
+  5. GPIO 四位元布林碼通知手臂移到對應取料點
   6. 手臂到位回傳 DONE → Pi 控制氣動夾爪充氣夾取
   7. 通知手臂移到放置點 → 手臂到位 → 洩氣放開
   8. 回到步驟 1,繼續偵測下一個手勢
@@ -27,7 +27,7 @@ TAIROA「視覺與機器人整合實作練習」
   紅色 = 手臂作動中,請勿靠近 (ARM RUNNING)
 
 【GPIO 訊號約定 (Pi ↔ 手臂機櫃)】
-  Pi 輸出 → 手臂:PICK_n (脈衝=去第n個取料點), PLACE (脈衝=去放置點)
+  Pi 輸出 → 手臂:PICK_CODE[4] (1000/1100/1110/1111), PLACE (脈衝=去放置點)
   Pi 輸入 ← 手臂:DONE (高電位=移動完成, 低電位=移動中)
   Pi 輸出 → 夾爪:PUMP (氣泵), VALVE (電磁閥)
 
@@ -83,25 +83,40 @@ FAKE_ARM = False
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
 
-COUNTDOWN_SEC = 5.0       # 同一手勢要維持幾秒才鎖定 (避免誤觸)
+COUNTDOWN_SEC = 2.0       # 同一手勢要維持幾秒才鎖定 (避免誤觸)
 
 # 中文字型 (Pi 上裝 fonts-noto-cjk 後的路徑;找不到自動退回英文)
 FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 
 # --- GPIO 腳位 (BCM 編號) ---
-# 手指數 → 取料點:one-hot,每個手指數一條線
-# 例:比 1 指 → GPIO5 送脈衝 → 手臂跑到第 1 個取料點
-PICK_PINS = {
-    1: 5,     # 1 指 → GPIO5  (實體腳位 29)
-    2: 6,     # 2 指 → GPIO6  (實體腳位 31)
-    3: 13,    # 3 指 → GPIO13 (實體腳位 33)
-    4: 16,    # 4 指 → GPIO16 (實體腳位 36)
-    5: 26,    # 5 指 → GPIO26 (實體腳位 37)  ← 只用 4 個取料點就刪這行
+# 手指數 → 4 路布林碼輸出。
+# 注意:你說的「16 位元」依範例應是「4 個 Boolean bit,可組成 16 種狀態」。
+# 這裡用 4 條線輸出左到右的 bit，例如 1 指 = 1000。
+CODE_PINS = [
+    5,      # CODE bit1 → GPIO5  (實體腳位 29)  1000 的第 1 位
+    6,      # CODE bit2 → GPIO6  (實體腳位 31)  1000 的第 2 位
+    13,     # CODE bit3 → GPIO13 (實體腳位 33)  1000 的第 3 位
+    16,     # CODE bit4 → GPIO16 (實體腳位 36)  1000 的第 4 位
+]
+
+# 手勢對應輸出碼:1=ON,0=OFF
+# 1 指 → 1000; 2 指 → 1100; 3 指 → 1110; 4 指 → 1111
+# 若只要 1~4 指控制手臂,5 指會被忽略,不會觸發手臂。
+FINGER_CODES = {
+    1: (1, 0, 0, 0),
+    2: (1, 1, 0, 0),
+    3: (1, 1, 1, 0),
+    4: (1, 1, 1, 1),
 }
-PLACE_PIN = 19   # Pi → 手臂:「去放置點」 (GPIO19, 實體腳位 35)
-DONE_PIN  = 21   # 手臂 → Pi:「移動完成」 (GPIO21, 實體腳位 40) [輸入]
-PUMP_PIN  = 17   # Pi → 繼電器 → 氣泵 (GPIO17, 實體腳位 11)
-VALVE_PIN = 27   # Pi → 繼電器 → 電磁閥 (GPIO27, 實體腳位 13)
+
+# 若繼電器/光耦是「低電位觸發」,請改成 False。
+# 設成 False 後,程式裡的 .on() 仍代表「輸出 1 / 吸合」。
+ARM_OUTPUT_ACTIVE_HIGH = True
+
+PLACE_PIN = 19   # Pi → 手臂:「去放置點」 (GPIO19,實體腳位 35)
+DONE_PIN  = 21   # 手臂 → Pi:「移動完成」 (GPIO21,實體腳位 40) [輸入]
+PUMP_PIN  = 17   # Pi → 繼電器 → 氣泵 (GPIO17,實體腳位 11)
+VALVE_PIN = 27   # Pi → 繼電器 → 電磁閥 (GPIO27,實體腳位 13)
 
 # --- 時間參數 ---
 INFLATE_SEC      = 2.0    # 充氣時間 (秒)
@@ -210,19 +225,32 @@ class Banner:
 # =====================================================================
 class ArmIO:
     """
-    GPIO 數位訊號與手臂通訊。握手:Pi 送脈衝 → 等手臂 DONE 拉高 → 下一步。
+    GPIO 數位訊號與手臂通訊。
+    手指數先轉成 4 路布林碼,例如:
+      1 指 → 1000
+      2 指 → 1100
+      3 指 → 1110
+      4 指 → 1111
+    然後維持 PULSE_SEC 秒,再清成 0000,接著等待手臂 DONE 拉高。
     """
 
-    def __init__(self, pick_pins, place_pin, done_pin):
-        self.pick = {n: OutputDevice(p, active_high=True, initial_value=False)
-                     for n, p in pick_pins.items()}
-        self.place = OutputDevice(place_pin, active_high=True, initial_value=False)
+    def __init__(self, code_pins, place_pin, done_pin):
+        self.code_outputs = [
+            OutputDevice(pin, active_high=ARM_OUTPUT_ACTIVE_HIGH, initial_value=False)
+            for pin in code_pins
+        ]
+        self.place = OutputDevice(place_pin, active_high=ARM_OUTPUT_ACTIVE_HIGH, initial_value=False)
         self.done = InputDevice(done_pin, pull_up=False)
 
-    def _pulse_then_wait(self, dev):
-        """送脈衝 → 等 DONE。"""
-        dev.on(); time.sleep(PULSE_SEC); dev.off()
-        return self._wait_done()
+    def _clear_code(self):
+        """將 4 路取料碼清成 0000,避免一直保持觸發狀態。"""
+        for dev in self.code_outputs:
+            dev.off()
+
+    def _set_code(self, code):
+        """依照 code tuple 設定 4 路布林輸出。"""
+        for bit, dev in zip(code, self.code_outputs):
+            dev.on() if bit else dev.off()
 
     def _wait_done(self):
         """等手臂 DONE 拉高,逾時回 False。"""
@@ -235,11 +263,30 @@ class ArmIO:
 
     def goto_pick(self, count):
         """通知手臂去第 count 個取料點。"""
-        return self._pulse_then_wait(self.pick[count])
+        code = FINGER_CODES[count]
+        code_str = "".join(str(bit) for bit in code)
+        print(f"[GPIO] {count} 指 → 輸出布林碼 {code_str}")
+
+        self._set_code(code)
+        time.sleep(PULSE_SEC)
+        self._clear_code()
+
+        return self._wait_done()
 
     def goto_place(self):
         """通知手臂去放置點。"""
-        return self._pulse_then_wait(self.place)
+        self.place.on()
+        time.sleep(PULSE_SEC)
+        self.place.off()
+        return self._wait_done()
+
+    def close(self):
+        """安全釋放所有輸出腳位。"""
+        self._clear_code()
+        self.place.off()
+        for dev in self.code_outputs:
+            dev.close()
+        self.place.close()
 
 
 # =====================================================================
@@ -276,7 +323,7 @@ class Gripper:
 # =====================================================================
 def run_cycle(arm, gripper, count):
     """取→放一次:去取料點→充氣→去放置點→洩氣。"""
-    print(f"[流程] 鎖定 {count} 指 → 送出取料點 {count} 指令")
+    print(f"[流程] 鎖定 {count} 指 → 送出 {count} 指對應布林碼")
     if not arm.goto_pick(count):
         print("[警告] 等手臂取料移動逾時,取消本次循環"); return
     print("[流程] 手臂到取料點,開始充氣夾取")
@@ -315,7 +362,7 @@ def main():
         print("== 第一階段:只測手勢辨識 (FAKE_ARM=True,不碰 GPIO/手臂) ==")
     else:
         gripper = Gripper(PUMP_PIN, VALVE_PIN)
-        arm = ArmIO(PICK_PINS, PLACE_PIN, DONE_PIN)
+        arm = ArmIO(CODE_PINS, PLACE_PIN, DONE_PIN)
         print("== 第二階段:接繼電器與手臂 (FAKE_ARM=False) ==")
 
     state = "DETECTING"
@@ -323,14 +370,14 @@ def main():
     countdown_start = None       # 倒數開始時間
     worker = None                # 背景執行緒
 
-    print("待機中,伸出手指 (1~5)。視窗:綠=待機 黃=倒數 紅=作動中。按 q 結束。")
+    print("待機中,伸出手指 (1~4)。視窗:綠=待機 黃=倒數 紅=作動中。按 q 結束。")
     try:
         while True:
             frame_rgb, count = cam.read()
             now = time.time()
 
             if state == "DETECTING":
-                if count in PICK_PINS:
+                if count in FINGER_CODES:
                     if count == candidate:
                         if now - countdown_start >= COUNTDOWN_SEC:
                             # 倒數結束、手勢沒變 → 鎖定,開背景執行緒跑手臂
@@ -372,7 +419,13 @@ def main():
             else:
                 frame = banner.draw(frame, "可偵測手勢", "READY", (0, 150, 0))
 
-            label = f"fingers: {count}" if count is not None else "no hand"
+            if count in FINGER_CODES:
+                code_str = "".join(str(bit) for bit in FINGER_CODES[count])
+                label = f"fingers: {count}  code: {code_str}"
+            elif count is not None:
+                label = f"fingers: {count}  code: none"
+            else:
+                label = "no hand"
             cv2.putText(frame, label, (20, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
@@ -385,6 +438,8 @@ def main():
     finally:
         if gripper is not None:   # 第一階段沒有夾爪物件,不用關
             gripper.off()
+        if arm is not None:       # 結束時把 4 路布林碼與 PLACE 都關掉
+            arm.close()
         cam.close()
         cv2.destroyAllWindows()
         print("結束程式。")
